@@ -1,5 +1,6 @@
 import csv
 import json
+import pandas as pd
 
 
 def data_read():
@@ -11,7 +12,8 @@ def data_read():
             id = block['id']
             query1 = block['query1']
             query2 = block['query2']
-            label = block['label']
+            # label = block['label']
+            label = -1
             temp = [id, query1, query2, label]
             word_lists.append(temp)
 
@@ -38,3 +40,8 @@ def data_write():
 
 if __name__ == '__main__':
     data_read()
+    df = pd.read_csv('./data/medicial/dev.csv',encoding='gbk')
+    df['l1'] = df['q1'].apply(lambda x: len(x))
+    df['l2'] = df['q2'].apply(lambda x: len(x))
+    print(df['l1'].describe([.2, .8]))
+    print(df['l2'].describe([.2, .8]))

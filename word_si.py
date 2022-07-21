@@ -11,14 +11,6 @@ from torch.optim import AdamW
 import random
 import torch.nn.functional as F
 
-from sklearn import metrics
-
-# from imblearn.over_sampling import RandomOverSampler
-
-
-SEED = 721
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
 
 def seed_init(seed):
     random.seed(seed)
@@ -29,15 +21,12 @@ def seed_init(seed):
     torch.backends.cudnn.deterministic = True
 
 
-seed_init(SEED)
-
-
 def get_dataloader():
-    Batch_Size = 16
+    Batch_Size = 32
 
     data = pd.read_csv('./data/word_similarity.csv')
-    data = data[:2000]
-
+    data = data[:20000]
+    # data = data[:2000]
     seg = pkuseg.pkuseg()
 
     data['t1'] = data["sen_a"].apply(lambda x: list(seg.cut(x)))
@@ -98,19 +87,27 @@ def get_dataloader():
     test_size = len(list(data["label"])) - train_size
     train_dataset, test_dataset = torch.utils.data.random_split(TextCNNDataSet, [train_size, test_size])
 
+    test_size = int(len(list(test_dataset)) * 0.5)
+    eval_size = int(len(list(test_dataset))) - test_size
+    eval_dataset, test_dataset = torch.utils.data.random_split(test_dataset, [eval_size,test_size])
+
     TrainDataLoader = Data.DataLoader(train_dataset, batch_size=Batch_Size, shuffle=True, drop_last=True)
+    EvalDataLoader = Data.DataLoader(eval_dataset, batch_size=Batch_Size, shuffle=False, drop_last=True)
     TestDataLoader = Data.DataLoader(test_dataset, batch_size=Batch_Size, shuffle=False, drop_last=True)
+    print('Training {} samples...'.format(len(TrainDataLoader.dataset)))
+    print('Evading {} samples...'.format(len(EvalDataLoader.dataset)))
+    print('Testing {} samples...'.format(len(TestDataLoader.dataset)))
+    return TrainDataLoader, EvalDataLoader, TestDataLoader
 
-    return TrainDataLoader, TestDataLoader
 
-
-class test_model(nn.Module):
+class same_con(nn.Module):
     def __init__(self):
-        super(test_model, self).__init__()
+        super(same_con, self).__init__()
         self.Vocab_size = 14331  # 词典大小
-        self.batch_size = 16
+        # self.Vocab_size = 2400
+        self.batch_size = 32
         self.n_hidden1 = 64  # bi-lstm的隐藏层大小
-        self.Embedding_dim = 100  # 词嵌入维度，这里我使用了word2vec预训练的词向量
+        self.Embedding_dim = 256  # 词嵌入维度，这里我使用了word2vec预训练的词向量
         self.n_class = 2  # 相似和不相似两种分类
         self.dropout = nn.Dropout(0.5)  # dropout设置为0.5，不知道后面起没起作用
         # self.Embedding_matrix = Embedding_matrix  # 词嵌入矩阵，#size=[Vocab_size,embedding_size]，可以自己训练一个词向量矩阵。
@@ -127,8 +124,8 @@ class test_model(nn.Module):
     def attention_weight1(self, outputs1, final_state1):  # 最好debug一步一步看怎么变化
         outputs1 = outputs1.permute(1, 0, 2)
         hidden = final_state1.view(-1, self.n_hidden1 * 2, 1)
-        attention_weights = torch.bmm(outputs1, hidden).squeeze(
-            2)  # z=torch.bmm(x,y)针对三维数组相乘，x=[a,b,c],y =[a,c,d], z = [a,b,c],这里的a,b,c,d都是size.
+        attention_weights = torch.bmm(outputs1, hidden).squeeze(2)
+        # z=torch.bmm(x,y)针对三维数组相乘，x=[a,b,c],y =[a,c,d], z = [a,b,c],这里的a,b,c,d都是size.
         soft_attention_weights1 = F.softmax(attention_weights, 1)
         context1 = torch.bmm(outputs1.transpose(1, 2), soft_attention_weights1.unsqueeze(2)).squeeze(2)
         return context1, soft_attention_weights1
@@ -162,66 +159,109 @@ class test_model(nn.Module):
         pass
 
 
-def train(model, device, train_loader, optimizer, criterion, epoch):
-    print('Training on {} samples...'.format(len(train_loader.dataset)))
-    model.train()
-    train_loss = 0
-    num_correct = 0
-    for batch_idx, batch in enumerate(train_loader):  # 返回的是元组，记得加括号
-        train_left = batch[0].to(device)
-        train_right = batch[1].to(device)
-        lables = batch[2].to(device)
+def train(model, device, tloader, eloader, optimizer, criterion, epochs, path):
+    now_cnt, stop_cnt = 0, 10
+    best_acc = 0
 
-        optimizer.zero_grad()
-        output = model(train_left, train_right)
-        loss = criterion(output, lables)
-        loss.backward()
-        optimizer.step()
-        train_loss += float(loss.item())
-        true = lables.data.cpu()
-        predict = torch.max(output, dim=1)[1].cpu()
-        num_correct += torch.eq(predict, true).sum().float().item()
-    train_acc = num_correct / len(train_loader.dataset)
-    train_loss = train_loss / len(train_loader)
-    msg = 'Epoch: {0:>5},  Train Loss: {1:>5.5},  Train Acc: {2:>6.4%}'
-    print(msg.format(epoch, train_loss, train_acc))
+    for epoch in range(epochs):
+        # 训练--------------------------------------
+        t_a = time.time()
 
-
-def eval(model, device, eval_loader, criterion, epoch):
-    t_a = time.time()
-
-    model.eval()
-    eval_loss = 0
-    num_correct = 0
-    for batch_idx, batch in enumerate(eval_loader):
-        with torch.no_grad():  # 返回的是元组，记得加括号
-            eval_left = batch[0].to(device)
-            eval_right = batch[1].to(device)
+        model.train()
+        train_loss = 0
+        num_correct = 0
+        for batch_idx, batch in enumerate(tloader):  # 返回的是元组，记得加括号
+            train_left = batch[0].to(device)
+            train_right = batch[1].to(device)
             lables = batch[2].to(device)
 
-            output = model(eval_left, eval_right)
+            optimizer.zero_grad()
+            output = model(train_left, train_right)
             loss = criterion(output, lables)
-            eval_loss += float(loss.item())
-            true = lables.data.cpu()
-            # print(true)
-            predict = torch.max(output, dim=1)[1].cpu()
-            num_correct += torch.eq(predict, true).sum().float().item()
-    eval_acc = num_correct / len(eval_loader.dataset)
+            loss.backward()
+            optimizer.step()
 
-    eval_loss = eval_loss / len(eval_loader)
+            train_loss += float(loss.item())
+            true = lables.data.cpu()
+            res = torch.max(output, dim=1)[1].cpu()
+            num_correct += torch.eq(res, true).sum().float().item()
+        train_acc = num_correct / len(tloader.dataset)
+        train_loss = train_loss / len(tloader)
+        t_b = time.time()
+        msg = 'Epoch: {0:>5},  Train Loss: {1:>5.5},  Train Acc: {2:>6.4%} ,Time: {3:>6.5}'
+        print(msg.format(epoch, train_loss, train_acc, t_b - t_a))
+
+        # 验证--------------------------------------
+        t_a = time.time()
+        model.eval()
+        eval_loss = 0
+        num_correct = 0
+        for batch_idx, batch in enumerate(eloader):
+            with torch.no_grad():
+                eval_left = batch[0].to(device)
+                eval_right = batch[1].to(device)
+                lables = batch[2].to(device)
+
+                output = model(eval_left, eval_right)
+                loss = criterion(output, lables)
+
+                eval_loss += float(loss.item())
+                true = lables.data.cpu()
+                res = torch.max(output, dim=1)[1].cpu()
+                num_correct += torch.eq(res, true).sum().float().item()
+        eval_acc = num_correct / len(eloader.dataset)
+        eval_loss = eval_loss / len(eloader)
+        t_b = time.time()
+        msg = 'Epoch: {0:>5},  eval Loss: {1:>5.5},  eval Acc: {2:>6.4%} ,Time: {3:>6.5}'
+        print(msg.format(epoch, eval_loss, eval_acc, t_b - t_a))
+
+        if eval_acc > best_acc:
+            print('训练效果更好，保存模型参数')
+            best_acc = eval_acc
+            torch.save(model.state_dict(), path)
+            now_cnt = 0
+        else:
+            now_cnt += 1
+            if now_cnt > stop_cnt:
+                print('模型已无提升停止训练,验证集最高精度:', best_acc)
+                break
+
+
+def predict(model, device, loader):
+    t_a = time.time()
+    model.eval()
+    num_correct = 0
+    for batch_idx, batch in enumerate(loader):
+        with torch.no_grad():  # 返回的是元组，记得加括号
+            test_left = batch[0].to(device)
+            test_right = batch[1].to(device)
+            lables = batch[2].to(device)
+
+            output = model(test_left, test_right)
+            true = lables.data.cpu()
+            res = torch.max(output, dim=1)[1].cpu()
+            num_correct += torch.eq(res, true).sum().float().item()
+    test_acc = num_correct / len(loader.dataset)
     t_b = time.time()
-    msg = 'Epoch: {0:>5},  eval Loss: {1:>5.5},  eval Acc: {2:>6.4%} ,Time: {3:>6.5}'
-    print(msg.format(epoch, eval_loss, eval_acc, t_b - t_a))
+    msg = 'Test Acc: {0:>6.4%} ,Time: {1:>6.5}'
+    print(msg.format(test_acc, t_b - t_a))
 
 
 if __name__ == '__main__':
-    Epochs = 60
-    Learn_rate = 0.001
-    device = torch.device("cuda" if torch.cuda.is_available() else 'cpu')
-    train_loader, test_loader = get_dataloader()
-    Bi_LstmModel = test_model().to(device)
+    SEED = 721
+    Learn_rate = 1e-3
+    Epochs = 5
+    save_path = 'model/use_att.pkl'
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    seed_init(SEED)
+
+    train_loader, eval_loader, test_loader = get_dataloader()
+    Bi_LstmModel = same_con().to(device)
     criterion = nn.CrossEntropyLoss().to(device)
-    # criterion = ContrastiveLoss().to(device)
     optimizer = AdamW(Bi_LstmModel.parameters(), lr=Learn_rate)
-    for epoch in range(Epochs):
-        train(Bi_LstmModel, device, train_loader, optimizer, criterion, epoch + 1)
+
+    train(Bi_LstmModel, device, train_loader, eval_loader, optimizer, criterion, Epochs + 1, save_path)
+
+    Bi_LstmModel.load_state_dict(torch.load(save_path))
+    predict(Bi_LstmModel, device, test_loader)
